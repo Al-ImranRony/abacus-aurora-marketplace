@@ -2,6 +2,29 @@
 
 The abacus counts, the aurora celebrates. A Claude Code mod that shows where your 5-hour limit goes.
 
+## Install
+
+Needs Claude Code. No GitHub login required.
+
+```bash
+claude plugin marketplace add Al-ImranRony/abacus-aurora-marketplace
+claude plugin install abacus-aurora@irony-mods
+```
+
+Start a new Claude Code session and run `/aurora` to open the pane. Inside a session the same works as
+`/plugin marketplace add Al-ImranRony/abacus-aurora-marketplace`, then `/plugin install abacus-aurora@irony-mods`.
+
+**Update:**
+
+```bash
+claude plugin marketplace update irony-mods
+claude plugin update abacus-aurora@irony-mods
+```
+
+**Remove:** `claude plugin uninstall abacus-aurora@irony-mods`
+
+The 5-hour bar and the device split read your Claude subscription sign-in; an API-key account has no 5-hour window to show.
+
 **Pane** (`/aurora`): one bar for the 5-hour window, split into *this device* and *other devices*; the reset time and
 weekly figure; this device's tasks in the window (all sessions on this machine, the running one marked ●), each with its
 share; the suggested next step.

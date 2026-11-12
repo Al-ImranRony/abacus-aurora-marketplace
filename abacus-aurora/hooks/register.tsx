@@ -109,6 +109,21 @@ export const rateOf = (samples: readonly number[]) => {
   return (s[lo] ?? 0) + ((s[lo + 1] ?? s[lo] ?? 0) - (s[lo] ?? 0)) * (i - lo)
 }
 
+// The rate in use sits far above this device's cleanest spans: other devices ran during most of them.
+export const isRateSuspect = (samples: readonly number[]) => {
+  if (samples.length < 8) return false
+  const s = [...samples].sort((a, b) => a - b)
+  const clean = s[1] ?? s[0] ?? 0
+  return (rateOf(s) ?? 0) > clean * 1.5
+}
+
+// `/aurora rate` argument: a positive %/USD figure, or auto to drop the fixed rate.
+export const parseRate = (arg: string | undefined): number | 'auto' | undefined => {
+  if (arg === 'auto') return 'auto'
+  const n = Number(arg)
+  return Number.isFinite(n) && n > 0 && n < 100 ? n : undefined
+}
+
 export const calibrate = (cal: Cal, deltaUsd: number, reading: SessionRateLimit | undefined, now: number): Cal => {
   const c = { ...cal, samples: [...cal.samples], acc: cal.acc + Math.max(0, deltaUsd) }
   if (!reading) return c
@@ -295,8 +310,11 @@ const loadLedger = async ($: Dollar): Promise<Ledger> => {
 
 // Reads the store fresh (other sessions on this device write it too) and redraws only on a change.
 const refresh = async ($: Dollar) => {
-  const [l, cal] = await Promise.all([loadLedger($), loadCal($)])
-  const next: Snapshot = { ledger: l, rate: rateOf(cal.samples), samples: cal.samples.length }
+  const [l, cal, fixed] = await Promise.all([loadLedger($), loadCal($), $.store.get('rateFixed')])
+  const learned = rateOf(cal.samples)
+  // A fixed rate shared by every device makes their splits mirror each other.
+  const rateFixed = typeof fixed === 'number' && fixed > 0 ? fixed : undefined
+  const next: Snapshot = { ledger: l, rate: rateFixed ?? learned, samples: cal.samples.length, learned, isFixed: rateFixed !== undefined, isSuspect: rateFixed === undefined && isRateSuspect(cal.samples) }
   const prev = await read($, snapshot)
   if (JSON.stringify(prev) !== JSON.stringify(next)) await update($, snapshot, () => next)
   lastSnap = next
@@ -639,8 +657,8 @@ export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({
       name: 'aurora',
-      description: 'Abacus Aurora: 5-hour limit by device and task · /aurora party | next | recs on|off | fx on|off | reset',
-      argumentHint: '[party|next|recs on|off|fx on|off|reset]',
+      description: 'Abacus Aurora: 5-hour limit by device and task · /aurora party | next | recs on|off | fx on|off | rate <n>|auto | reset',
+      argumentHint: '[party|next|recs on|off|fx on|off|rate <n>|auto|reset]',
     })
     await $.tool.register({ name: 'celebrate', description: 'Abacus Aurora: launch the fireworks celebration now and report whether the backdrop and card were drawn.', inputSchema: { type: 'object', properties: { title: { type: 'string' } } } })
     await $.tool.register({ name: 'status', description: 'Abacus Aurora: the 5-hour split (this device vs other devices, per task), calibration state and recent diagnostics.', inputSchema: { type: 'object' } })
@@ -672,7 +690,8 @@ export const register: Register = on => {
     const last = (await read($, reports)).at(-1)
     await poll($, true).catch(() => undefined)
     const t = await read($, totals)
-    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)}; rate ${snap.rate ?? 'uncalibrated'} %/USD from ${snap.samples} samples; live poll: ${pollNote || 'not yet'}; session tokens in+out ${fmt(t.io)}, cache ${fmt(t.cache)}`
+    const rateNote = snap.isFixed ? `rate ${snap.rate} %/USD fixed (learned ${snap.learned ?? 'none'} from ${snap.samples} samples)` : `rate ${snap.rate ?? 'uncalibrated'} %/USD learned from ${snap.samples} samples${snap.isSuspect ? ', likely inflated by other devices' : ''}`
+    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)}; ${rateNote}; live poll: ${pollNote || 'not yet'}; session tokens in+out ${fmt(t.io)}, cache ${fmt(t.cache)}`
     const rows = v.rows.map(r => `${r.isLive ? 'running' : 'task'} ${r.isHere ? '(this session)' : '(other session)'} "${short(r.title, 50)}": ${pct(r.share)}`)
     const summary = last ? `last task #${last.n}: rec ${last.recState}${last.rec ? ` -> ${last.rec.model}: ${last.rec.task}` : ''}` : 'no task report in this session yet'
     return { result: [split, ...rows, summary, ...lines.slice(-20)].join('\n') }
@@ -820,6 +839,18 @@ export const register: Register = on => {
       await update($, settings, s => (verb === 'recs' ? { ...s, recommend: enable } : { ...s, celebrate: enable }))
       return { text: `${verb === 'recs' ? 'Next-task recommendations' : 'Celebrations'} ${enable ? 'on' : 'off'}.` }
     }
+    if (verb === 'rate') {
+      const r = parseRate(arg)
+      if (r === undefined) {
+        const snap = await refresh($)
+        const now = snap.learned !== undefined ? `learned ${snap.learned.toFixed(3)}` : 'not learned yet'
+        return { text: `Rate ${snap.isFixed ? `fixed at ${snap.rate}` : 'auto'} (${now} %/USD). Use /aurora rate <n> with the same figure on every device, or /aurora rate auto.` }
+      }
+      if (r === 'auto') await $.store.delete('rateFixed')
+      else await $.store.set('rateFixed', r)
+      await refresh($)
+      return { text: r === 'auto' ? 'Rate back to auto: this device learns its own.' : `Rate fixed at ${r} %/USD. Set the same figure on your other devices so their splits match.` }
+    }
     if (verb === 'reset') {
       await $.store.delete('cal2')
       await $.store.delete('calib')
@@ -911,6 +942,14 @@ export const register: Register = on => {
           ) : (
             <Text dimColor>Learning this device's share — needs about {SPAN * 2}% of use.</Text>
           )}
+          {snap.rate !== undefined ? (
+            <Text dimColor>
+              Rate {snap.rate.toFixed(3)} %/$ {snap.isFixed ? '(fixed)' : `(learned, ${snap.samples} samples)`}
+            </Text>
+          ) : null}
+          {snap.isSuspect ? (
+            <Text color={C.next}>Rate likely inflated by other devices' use. Set it from your main device: /aurora rate {'<n>'}</Text>
+          ) : null}
           {snap.ledger.weekly !== undefined ? <Text dimColor>Weekly {pct(snap.ledger.weekly)}</Text> : null}
         </Box>
 

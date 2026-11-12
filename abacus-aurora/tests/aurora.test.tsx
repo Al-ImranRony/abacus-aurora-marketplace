@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { calibrate, isFollowUp, parseUsage, rateOf, splitWindow, windowTokens } from '../hooks/register'
+import { calibrate, isFollowUp, isRateSuspect, parseRate, parseUsage, rateOf, splitWindow, windowTokens } from '../hooks/register'
 
 const RESET = '2030-01-01T05:00:00.000Z'
 const usage = (model: string, input: number, output: number) => ({
@@ -21,6 +21,7 @@ const device = async ($: any, on: any, sessionId: string, tasks: { title: string
   const asks = { model: 0 }
   on('command.register', () => ({ value: { command: 'aurora' } }))
   on('tool.register', () => ({ value: {} }))
+  on('command.run', () => ({ text: '' }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: sessionId }))
@@ -197,4 +198,51 @@ test('only prompts the user gave start a task', () => {
   expect(isFollowUp({ text: 'done', origin: { kind: 'task-notification' } })).toBe(true)
   expect(isFollowUp({ text: '<task-notification> <task-id>b1</task-id>' })).toBe(true)
   expect(isFollowUp({ text: 'idle', isMeta: true })).toBe(true)
+})
+
+test("with one shared rate, each device's own share is the other's other-devices share", () => {
+  const task = (id: string, usd: number) => ({ id, sid: 's', title: id, at: 1, usd, tokens: 1 })
+  // Mac spent $16, the other device $4; at 1.84 %/$ the window reads 36.8%.
+  const ledgerOf = (usd: number) => ({ reset: RESET, pct: 36.8, tasks: [task('t', usd)], live: {} })
+  const mac = splitWindow({ rate: 1.84, samples: 20, ledger: ledgerOf(16) }, 's', 1_000)
+  const other = splitWindow({ rate: 1.84, samples: 20, ledger: ledgerOf(4) }, 's', 1_000)
+  expect(+(mac.mine ?? NaN).toFixed(2)).toBe(29.44)
+  expect(+(other.other ?? NaN).toFixed(2)).toBe(29.44)
+  expect(+(other.mine ?? NaN).toFixed(2)).toBe(7.36)
+  expect(+(mac.other ?? NaN).toFixed(2)).toBe(7.36)
+})
+
+test('a fixed rate wins over the learned one until set back to auto', async ($, on) => {
+  const { clock } = await device($, on, 'sF', [{ title: 'Work', usd: 4, windowAfter: 10 }])
+  const run = (args: string) => $.command.run({ command: 'aurora', args } as never) as Promise<{ text: string }>
+  expect((await run('rate 2')).text).toMatch(/fixed at 2 /)
+  await clock.advance(20_000)
+  let pane = await mountPane($)
+  expect((await pane.find({ type: 'Text', text: /^8\.0%$/ }))?.text).toBe('8.0%')
+  expect(await pane.find({ type: 'Text', text: /Rate 2\.000 %\/\$ \(fixed\)/ })).toBeDefined()
+  await pane.unmount()
+  expect((await run('rate auto')).text).toMatch(/auto/)
+  await clock.advance(20_000)
+  pane = await mountPane($)
+  expect((await pane.find({ type: 'Text', text: /^4\.0%$/ }))?.text).toBe('4.0%')
+  expect(await pane.find({ type: 'Text', text: /\(learned, 4 samples\)/ })).toBeDefined()
+  await pane.unmount()
+  expect((await run('rate nonsense')).text).toMatch(/Rate auto/)
+})
+
+test('a rate learned mostly while other devices ran is flagged; a clean one is not', () => {
+  // This Mac's real samples on 2026-11-12: a tight cluster near 1.9 with a few contaminated spans.
+  const mac = [1.8, 1.98, 2.03, 2.38, 2.31, 1.12, 9.93, 2.07, 1.81, 1.59, 2.92, 1.92, 2.12, 1.85, 1.9, 1.7, 3.94, 2.05, 2.13, 5.27]
+  expect(isRateSuspect(mac)).toBe(false)
+  // A light device whose spans mostly overlap the heavy one's work.
+  expect(isRateSuspect([1.9, 2.1, 3.5, 4.2, 5, 4.8, 6.1, 3.9, 4.4, 7.2])).toBe(true)
+  expect(isRateSuspect([9, 9, 9])).toBe(false)
+})
+
+test('the rate command takes a positive figure or auto', () => {
+  expect(parseRate('1.84')).toBe(1.84)
+  expect(parseRate('auto')).toBe('auto')
+  expect(parseRate('0')).toBeUndefined()
+  expect(parseRate(undefined)).toBeUndefined()
+  expect(parseRate('x')).toBeUndefined()
 })

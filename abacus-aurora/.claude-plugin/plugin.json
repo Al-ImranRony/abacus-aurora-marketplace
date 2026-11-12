@@ -1,6 +1,6 @@
 {
   "name": "abacus-aurora",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "5-hour limit split by device and by task, with a next-step pick and live token counts and fireworks when a piece of work lands",
   "types": "./types/index.d.ts",
   "author": { "name": "Rony" },

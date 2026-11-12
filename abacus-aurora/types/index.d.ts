@@ -37,7 +37,8 @@ export type Ledger = {
   tasks: LedgerTask[]
   live: Record<string, LedgerLive>
 }
-export type Snapshot = { ledger: Ledger; rate?: number; samples: number }
+// rate is the one in use: the fixed one when set (shared across devices), else learned.
+export type Snapshot = { ledger: Ledger; rate?: number; samples: number; learned?: number; isFixed?: boolean; isSuspect?: boolean }
 export type Party = { id: string; title: string; at: number }
 export type Settings = { recommend: boolean; celebrate: boolean }
 

@@ -1,0 +1,12 @@
+{
+  "name": "twinbit-mods",
+  "description": "Rony's Claude Code mods",
+  "owner": { "name": "Rony" },
+  "plugins": [
+    {
+      "name": "abacus-aurora",
+      "source": "./abacus-aurora",
+      "description": "5-hour limit split by device and by task, with a next-step pick, live token counts and milestone fireworks"
+    }
+  ]
+}

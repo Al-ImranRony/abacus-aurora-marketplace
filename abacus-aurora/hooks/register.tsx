@@ -288,6 +288,43 @@ let lastLiveWrite = 0
 let lastSnap: Snapshot | null = null
 let lastDraw = 0
 let pollNote = ''
+// The /mods switchboard turns this mod off in every chat: `"abacus-aurora": false` in <claude dir>/mods/switches.json.
+let off = false
+const SWITCH_MS = 3000
+const OFF_TEXT = 'Abacus Aurora is off. Turn it on in /mods.'
+
+const claudeDirOf = async ($: Dollar) => {
+  const home = ((await $.env.get('HOME').catch(() => undefined)) ?? '').trim()
+  const set = ((await $.env.get('CLAUDE_CONFIG_DIR').catch(() => undefined)) ?? '').trim()
+  const full = set === '~' ? home : set.startsWith('~/') ? `${home}${set.slice(1)}` : set
+  return full || `${home}/.claude`
+}
+
+// Reads the switch; on a change it clears or redraws what this mod shows. A broken or missing file changes nothing.
+const readSwitch = async ($: Dollar) => {
+  let nowOff = off
+  try {
+    const path = `${await claudeDirOf($)}/mods/switches.json`
+    if (await $.fs.exists(path)) {
+      const json = JSON.parse(String(await $.fs.read(path))) as unknown
+      nowOff = !!json && typeof json === 'object' && (json as Record<string, unknown>)[P] === false
+    } else nowOff = false
+  } catch {
+    return
+  }
+  if (nowOff === off) return
+  off = nowOff
+  if (off) {
+    cur = null
+    streaming.clear()
+    $.ui.status(undefined)
+    await update($, party, () => null).catch(() => undefined)
+  } else {
+    const snap = await refresh($).catch(() => null)
+    if (snap) await statusLine($, snap, await $.clock.now()).catch(() => undefined)
+  }
+  $.ui.invalidate('ui.render')
+}
 // Characters streamed so far by each response still in flight (several when subagents run).
 const streaming = new Map<string, number>()
 let chain: Promise<unknown> = Promise.resolve()
@@ -664,26 +701,35 @@ export const register: Register = on => {
     await $.tool.register({ name: 'status', description: 'Abacus Aurora: the 5-hour split (this device vs other devices, per task), calibration state and recent diagnostics.', inputSchema: { type: 'object' } })
     const result = await next(e)
     sid = await $.session.id()
+    await readSwitch($)
+    $.clock.every(SWITCH_MS, () => void readSwitch($).catch(() => undefined))
     const u = await $.session.usage().catch(() => null)
     lastCost = u?.cost?.usd
-    await writeLedger($, await $.clock.now(), u?.rateLimits, () => undefined).catch(() => undefined)
-    await refresh($).catch(() => undefined)
-    void poll($, true).catch(() => undefined)
+    if (!off) {
+      await writeLedger($, await $.clock.now(), u?.rateLimits, () => undefined).catch(() => undefined)
+      await refresh($).catch(() => undefined)
+      void poll($, true).catch(() => undefined)
+    }
     $.clock.every(20_000, async () => {
+      if (off) return
       const snap = await refresh($).catch(() => null)
       if (snap) await statusLine($, snap, await $.clock.now()).catch(() => undefined)
     })
-    $.clock.every(POLL_MS, () => void poll($).catch(() => undefined))
+    $.clock.every(POLL_MS, () => {
+      if (!off) void poll($).catch(() => undefined)
+    })
     return result
   })
 
   on('tool.call', { tool: 'mcp__abacus-aurora__celebrate' }, async ($, e) => {
+    if (off) return { result: OFF_TEXT }
     const title = typeof (e as unknown as { title?: unknown }).title === 'string' ? String((e as unknown as { title: string }).title) : 'Demo celebration'
     const r = await celebrate($, title)
     return { result: `pane open: ${r.pane}; full-window backdrop drawn: ${r.backdrop}; transcript card placed: ${r.card}; clears in ${PARTY_MS / 1000}s` }
   })
 
   on('tool.call', { tool: 'mcp__abacus-aurora__status' }, async $ => {
+    if (off) return { result: OFF_TEXT }
     const lines = ((await $.store.get('diag')) as string[] | undefined) ?? []
     const snap = await refresh($)
     const v = splitWindow(snap, sid, await $.clock.now())
@@ -706,7 +752,7 @@ export const register: Register = on => {
   }).catch(($, e, next) => next(e))
 
   on('turn.start', async ($, e, next) => {
-    if (e.agentId !== undefined || cur) return next(e)
+    if (off || e.agentId !== undefined || cur) return next(e)
     settleGen += 1
     const isNew = hasNewPrompt || !prev
     hasNewPrompt = false
@@ -750,7 +796,7 @@ export const register: Register = on => {
       for await (const c of stream) {
         if (c.kind === 'text' || c.kind === 'thinking') chars += c.text.length
         else if (c.kind === 'input') chars += c.json.length
-        if (cur) {
+        if (cur && !off) {
           streaming.set(key, chars)
           drawSoon($, await $.clock.now())
         }
@@ -761,7 +807,7 @@ export const register: Register = on => {
     }
     const r = await stream.result
     const u = r.usage
-    if (u) {
+    if (u && !off) {
       const task = cur
       if (task) {
         task.tokens += tokensOf(u)
@@ -824,6 +870,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'aurora' }, async ($, e) => {
     const [verb, arg] = e.args.replace(/[\[\]<>]/g, ' ').trim().toLowerCase().split(/\s+/)
+    if (off) return { text: OFF_TEXT }
     if (verb === 'party') {
       await celebrate($, 'Manual celebration')
       return { text: '🎆 Fireworks launched.' }
@@ -862,7 +909,7 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Backdrop' }, async ($, e, next) => {
-    if (e.props.plugin !== P) return next(e)
+    if (off || e.props.plugin !== P) return next(e)
     const p = await read($, party)
     if (!p) return next(e)
     const ui = $.ui.resolve(e)
@@ -899,6 +946,13 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const ui = $.ui.resolve(e)
     const { Box, Text, Button } = ui
+    if (off) {
+      return (
+        <Box flexDirection="column" paddingX={1}>
+          <Text dimColor>{OFF_TEXT}</Text>
+        </Box>
+      )
+    }
     const Svg = 'Svg' in ui ? ui.Svg : undefined
     const snap = await read($, snapshot)
     const s = await read($, settings)

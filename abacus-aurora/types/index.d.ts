@@ -38,7 +38,10 @@ export type Ledger = {
   live: Record<string, LedgerLive>
 }
 // rate is the one in use: the fixed one when set (shared across devices), else learned.
-export type Snapshot = { ledger: Ledger; rate?: number; samples: number; learned?: number; isFixed?: boolean; isSuspect?: boolean }
+// foreign = window points this device saw move while it spent nothing: a floor on other devices' share.
+export type Snapshot = { ledger: Ledger; rate?: number; samples: number; learned?: number; isFixed?: boolean; isSuspect?: boolean; foreign?: number }
+// Device-wide tracker of the window moving while this device is idle; usdAt = when this device last spent.
+export type Foreign = { reset?: string; pct: number; lastP?: number; lastUsd?: number; lastAt?: number; usdAt?: number }
 export type Party = { id: string; title: string; at: number }
 export type Settings = { recommend: boolean; celebrate: boolean }
 

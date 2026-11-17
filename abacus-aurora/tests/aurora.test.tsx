@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { calibrate, isFollowUp, isRateSuspect, parseRate, parseUsage, rateOf, splitWindow, windowTokens } from '../hooks/register'
+import { calibrate, FOREIGN_LAG_MS, isFollowUp, isRateSuspect, parseRate, parseUsage, rateOf, splitWindow, trackForeign, windowTokens } from '../hooks/register'
 
 const RESET = '2030-01-01T05:00:00.000Z'
 const usage = (model: string, input: number, output: number) => ({
@@ -12,7 +12,7 @@ const usage = (model: string, input: number, output: number) => ({
 })
 
 // One device: runs tasks that cost the given USD while the account-wide window reads the given percents.
-const device = async ($: any, on: any, sessionId: string, tasks: { title: string; usd: number; windowAfter: number; wake?: boolean }[]) => {
+const device = async ($: any, on: any, sessionId: string, tasks: { title: string; usd: number; windowAfter: number; wake?: boolean }[], opts: { recs?: boolean } = { recs: true }) => {
   const clock = mock.clock(on, { now: 1_000 })
   // Calibrated at 1% of the 5-hour window per API-equivalent dollar.
   mock.store(on, { cal2: { anchor: -1, prev: -1, acc: 0, exact: false, lastAt: 0, samples: [1, 1, 1, 1] } })
@@ -52,6 +52,8 @@ const device = async ($: any, on: any, sessionId: string, tasks: { title: string
     value: { isAnswered: true, text: '{"task":"Commit and push","model":"Haiku 5.5","effort":"low","why":"git"}', usage: usage('claude-haiku-5-5', 10, 10) },
   }))
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  // Next-step starts off in a new session; most tests here exercise it, so they turn it on as a person would.
+  if (opts.recs) await $.command.run({ command: 'aurora', args: 'recs on' } as never)
   for (const [i, t] of tasks.entries()) {
     await $.prompt.submit((t.wake ? { text: `<task-notification> ${t.title}`, origin: { kind: 'task-notification' } } : { text: t.title }) as never)
     await $.turn.start({ turnId: `t${i}` } as never)
@@ -245,4 +247,48 @@ test('the rate command takes a positive figure or auto', () => {
   expect(parseRate('0')).toBeUndefined()
   expect(parseRate(undefined)).toBeUndefined()
   expect(parseRate('x')).toBeUndefined()
+})
+
+test('a new session starts with Next-step and Fireworks off, and asks Haiku nothing', async ($, on) => {
+  const { asks } = await device($, on, 'sD', [{ title: 'Some work', usd: 1, windowAfter: 1 }], { recs: false })
+  expect(asks.model).toBe(0)
+  const pane = await mountPane($)
+  expect(await pane.find({ type: 'Button', label: 'Next-step off' })).toBeDefined()
+  expect(await pane.find({ type: 'Button', label: 'Fireworks off' })).toBeDefined()
+  await pane.unmount()
+})
+
+test('the window moving while this device is idle counts as other devices, once the reading has had time to catch up', () => {
+  const r = (p: number) => ({ kind: 'five_hour', percentUsed: p, resetsAt: RESET }) as never
+  let t = trackForeign({ pct: 0 }, r(40), 10, 0)
+  // This device spent $1 since: its own use, not foreign.
+  t = trackForeign(t.f, r(42), 11, 60_000)
+  expect(t.moved).toBe(0)
+  // Quiet, but the reading may still trail its last response: not counted yet.
+  t = trackForeign(t.f, r(43), 11, 60_000 + FOREIGN_LAG_MS)
+  expect(t.moved).toBe(0)
+  // This interval began a full lag after the last spend: the 3 points are another device's.
+  t = trackForeign(t.f, r(46), 11, 120_000 + FOREIGN_LAG_MS)
+  expect(t.moved).toBe(3)
+  expect(t.f.pct).toBe(3)
+  // A new window starts the count over.
+  t = trackForeign(t.f, { kind: 'five_hour', percentUsed: 2, resetsAt: '2030-01-01T10:00:00.000Z' } as never, 11, 900_000)
+  expect(t.f.pct).toBe(0)
+})
+
+test("this device's share never takes the points other devices were seen using", () => {
+  // The morning case: window 99%, this device's learned rate too high (61%), other device seen using 46%.
+  const ledger = { reset: RESET, pct: 99, tasks: [{ id: 't', sid: 's', title: 't', at: 1, usd: 30.5, tokens: 1 }], live: {} }
+  const v = splitWindow({ rate: 2, samples: 20, ledger, foreign: 46 }, 's', 1_000)
+  expect(+(v.mine ?? NaN).toFixed(1)).toBe(53)
+  expect(+(v.other ?? NaN).toFixed(1)).toBe(46)
+  expect(+(v.rows[0]?.share ?? NaN).toFixed(1)).toBe(53)
+})
+
+test('three devices at once: spans where others ran are skipped, so the learned rate stays near the true one', () => {
+  // True rate 2 %/$; 14 of 20 spans also carried one or two other devices' use.
+  const samples = [2.02, 1.97, 2.05, 1.99, 2.03, 2.01, 3.1, 4.2, 2.9, 5.8, 3.4, 6.1, 2.7, 4.4, 3.9, 5.2, 3.3, 2.8, 4.9, 3.6]
+  const rate = rateOf(samples) ?? NaN
+  expect(rate > 1.9 && rate < 2.1).toBe(true)
+  expect(isRateSuspect(samples)).toBe(true)
 })

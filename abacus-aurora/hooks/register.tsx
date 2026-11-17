@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { ElementTable, EngineInterface, Register, SessionRateLimit, TurnUsage } from 'claude-code'
 
-import type { Ledger, LedgerTask, Party, Rec, Report, Settings, Snapshot, Totals } from '../types'
+import type { Foreign, Ledger, LedgerTask, Party, Rec, Report, Settings, Snapshot, Totals } from '../types'
 
 type Dollar = EngineInterface
 
@@ -31,7 +31,8 @@ const FOLLOW_UP_KINDS = new Set(['task-notification', 'auto-continuation', 'obse
 const reports = atom({ plugin: 'abacus-aurora', key: 'reports' } as const, [] as Report[], { shape: 'reports-2' })
 const snapshot = atom({ plugin: 'abacus-aurora', key: 'snapshot' } as const, { ledger: { tasks: [], live: {} }, samples: 0 } as Snapshot, { shape: 'snapshot-1' })
 const party = atom({ plugin: 'abacus-aurora', key: 'party' } as const, null as Party | null)
-const settings = atom({ plugin: 'abacus-aurora', key: 'settings' } as const, { recommend: true, celebrate: true } as Settings)
+// Next-step and Fireworks start off in every new session; the pane buttons or /aurora recs|fx on turn them on.
+const settings = atom({ plugin: 'abacus-aurora', key: 'settings' } as const, { recommend: false, celebrate: false } as Settings)
 const dismissed = atom({ plugin: 'abacus-aurora', key: 'dismissed' } as const, [] as string[])
 const totals = atom({ plugin: 'abacus-aurora', key: 'totals' } as const, { io: 0, cache: 0 } as Totals)
 
@@ -65,7 +66,8 @@ const MODELS = [
   { name: 'Fable 5.1', id: 'claude-fable-5-1' },
 ] as const
 
-const C = { mine: '#06d6a0', other: '#b5179e', free: '#8883', accent: '#4cc9f0', next: '#ffd166' }
+// Bars: ocean blue for this device, lemon for other devices.
+const C = { mine: '#0077be', other: '#fff44f', free: '#8883', accent: '#4cc9f0', next: '#ffd166' }
 
 const tokensOf = (u: TurnUsage) => u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens
 const ioOf = (u: TurnUsage) => u.input_tokens + u.output_tokens
@@ -99,22 +101,22 @@ const sameWindow = (a?: string, b?: string) => {
   return Number.isNaN(x) || Number.isNaN(y) || Math.abs(x - y) < IDLE_MS
 }
 
-// Other devices only ever add to a span's movement, so the true rate sits at the low end of the samples.
+// Other devices only ever add to a span's movement, so the true rate sits at the low end: the 15th percentile, which still skips a lone low outlier.
 export const rateOf = (samples: readonly number[]) => {
   if (samples.length === 0) return undefined
   const s = [...samples].sort((a, b) => a - b)
   if (s.length < 4) return s[0]
-  const i = (s.length - 1) * 0.25
+  const i = (s.length - 1) * 0.15
   const lo = Math.floor(i)
   return (s[lo] ?? 0) + ((s[lo + 1] ?? s[lo] ?? 0) - (s[lo] ?? 0)) * (i - lo)
 }
 
-// The rate in use sits far above this device's cleanest spans: other devices ran during most of them.
+// Most spans sit far above the rate in use: other devices ran during most of them, so the low end is thin evidence.
 export const isRateSuspect = (samples: readonly number[]) => {
   if (samples.length < 8) return false
   const s = [...samples].sort((a, b) => a - b)
-  const clean = s[1] ?? s[0] ?? 0
-  return (rateOf(s) ?? 0) > clean * 1.5
+  const mid = s.length % 2 ? (s[(s.length - 1) / 2] ?? 0) : ((s[s.length / 2 - 1] ?? 0) + (s[s.length / 2] ?? 0)) / 2
+  return mid > (rateOf(s) ?? 0) * 1.5
 }
 
 // `/aurora rate` argument: a positive %/USD figure, or auto to drop the fixed rate.
@@ -145,6 +147,26 @@ export const calibrate = (cal: Cal, deltaUsd: number, reading: SessionRateLimit 
   return c
 }
 
+// The window's reading can trail this device's last response; idle movement counts only once the device has been quiet this long.
+export const FOREIGN_LAG_MS = 90_000
+
+// This device's spend in the current window, every session's finished and running tasks.
+export const deviceUsd = (l: Ledger, now: number) =>
+  l.tasks.reduce((n, t) => n + t.usd, 0) + Object.values(l.live).filter(v => now - v.at < LIVE_TTL).reduce((n, v) => n + v.usd, 0)
+
+// Each poll: when the window moved but this device spent nothing (and had been quiet a while), another device or app moved it.
+export const trackForeign = (f: Foreign, reading: SessionRateLimit, usd: number, now: number): { f: Foreign; moved: number } => {
+  const p = reading.percentUsed
+  if (f.lastP === undefined || !sameWindow(f.reset, reading.resetsAt) || p < f.lastP) {
+    return { f: { reset: reading.resetsAt ?? f.reset, pct: 0, lastP: p, lastUsd: usd, lastAt: now, usdAt: f.usdAt ?? now }, moved: 0 }
+  }
+  const spent = usd - (f.lastUsd ?? usd) > 1e-9
+  const usdAt = spent ? now : (f.usdAt ?? 0)
+  const quietFor = (f.lastAt ?? now) - usdAt
+  const moved = !spent && p > f.lastP && quietFor >= FOREIGN_LAG_MS ? p - f.lastP : 0
+  return { f: { ...f, reset: reading.resetsAt ?? f.reset, pct: f.pct + moved, lastP: p, lastUsd: usd, lastAt: now, usdAt }, moved }
+}
+
 export type WindowView = {
   total?: number
   mine?: number
@@ -167,7 +189,9 @@ export const splitWindow = (snap: Snapshot, sid: string, now: number): WindowVie
   if (snap.rate === undefined) return { total, rows: raw.map(r => ({ ...r, share: undefined })) }
   const rate = snap.rate
   const mineRaw = raw.reduce((n, r) => n + r.usd * rate, 0)
-  const scale = total !== undefined && mineRaw > total && mineRaw > 0 ? total / mineRaw : 1
+  // Never more than the window less what other devices were seen using.
+  const cap = total !== undefined ? Math.max(0, total - Math.min(total, snap.foreign ?? 0)) : undefined
+  const scale = cap !== undefined && mineRaw > cap && mineRaw > 0 ? cap / mineRaw : 1
   const mine = mineRaw * scale
   return {
     total,
@@ -340,6 +364,10 @@ const loadCal = async ($: Dollar): Promise<Cal> => {
   const v = (await $.store.get('cal2')) as Cal | undefined
   return v && Array.isArray(v.samples) ? v : { anchor: -1, prev: -1, acc: 0, exact: false, lastAt: 0, samples: [] }
 }
+const loadForeign = async ($: Dollar): Promise<Foreign> => {
+  const v = (await $.store.get('foreign')) as Foreign | undefined
+  return v && typeof v.pct === 'number' ? v : { pct: 0 }
+}
 const loadLedger = async ($: Dollar): Promise<Ledger> => {
   const v = (await $.store.get('ledger2')) as Ledger | undefined
   return v && Array.isArray(v.tasks) ? { ...v, live: v.live ?? {} } : emptyLedger()
@@ -347,11 +375,12 @@ const loadLedger = async ($: Dollar): Promise<Ledger> => {
 
 // Reads the store fresh (other sessions on this device write it too) and redraws only on a change.
 const refresh = async ($: Dollar) => {
-  const [l, cal, fixed] = await Promise.all([loadLedger($), loadCal($), $.store.get('rateFixed')])
+  const [l, cal, fixed, f] = await Promise.all([loadLedger($), loadCal($), $.store.get('rateFixed'), loadForeign($)])
   const learned = rateOf(cal.samples)
   // A fixed rate shared by every device makes their splits mirror each other.
   const rateFixed = typeof fixed === 'number' && fixed > 0 ? fixed : undefined
-  const next: Snapshot = { ledger: l, rate: rateFixed ?? learned, samples: cal.samples.length, learned, isFixed: rateFixed !== undefined, isSuspect: rateFixed === undefined && isRateSuspect(cal.samples) }
+  const foreign = f.pct > 0 && sameWindow(f.reset, l.reset) ? f.pct : undefined
+  const next: Snapshot = { ledger: l, rate: rateFixed ?? learned, samples: cal.samples.length, learned, isFixed: rateFixed !== undefined, isSuspect: rateFixed === undefined && isRateSuspect(cal.samples), foreign }
   const prev = await read($, snapshot)
   if (JSON.stringify(prev) !== JSON.stringify(next)) await update($, snapshot, () => next)
   lastSnap = next
@@ -436,6 +465,17 @@ const poll = async ($: Dollar, force = false) => {
   }
   pollNote = `ok at ${new Date(now).toISOString().slice(11, 19)}Z: 5h ${win(limits, 'five_hour')?.percentUsed}%`
   await writeLedger($, now, limits, () => undefined)
+  const r5 = win(limits, 'five_hour')
+  if (r5) {
+    const moved = await serial(async () => {
+      const t = trackForeign(await loadForeign($), r5, deviceUsd(await loadLedger($), now), now)
+      await $.store.set('foreign', t.f)
+      // The open calibration span saw another device's use: drop it rather than learn an inflated rate.
+      if (t.moved > 0) await $.store.set('cal2', { ...(await loadCal($)), exact: false })
+      return t.moved
+    })
+    if (moved > 0) await diag($, `idle window moved ${moved.toFixed(2)} pts: other devices`).catch(() => undefined)
+  }
   await statusLine($, await refresh($), now)
 }
 
@@ -737,7 +777,7 @@ export const register: Register = on => {
     await poll($, true).catch(() => undefined)
     const t = await read($, totals)
     const rateNote = snap.isFixed ? `rate ${snap.rate} %/USD fixed (learned ${snap.learned ?? 'none'} from ${snap.samples} samples)` : `rate ${snap.rate ?? 'uncalibrated'} %/USD learned from ${snap.samples} samples${snap.isSuspect ? ', likely inflated by other devices' : ''}`
-    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)}; ${rateNote}; live poll: ${pollNote || 'not yet'}; session tokens in+out ${fmt(t.io)}, cache ${fmt(t.cache)}`
+    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)} (seen while idle ${pct(snap.foreign ?? 0)}); ${rateNote}; live poll: ${pollNote || 'not yet'}; session tokens in+out ${fmt(t.io)}, cache ${fmt(t.cache)}`
     const rows = v.rows.map(r => `${r.isLive ? 'running' : 'task'} ${r.isHere ? '(this session)' : '(other session)'} "${short(r.title, 50)}": ${pct(r.share)}`)
     const summary = last ? `last task #${last.n}: rec ${last.recState}${last.rec ? ` -> ${last.rec.model}: ${last.rec.task}` : ''}` : 'no task report in this session yet'
     return { result: [split, ...rows, summary, ...lines.slice(-20)].join('\n') }

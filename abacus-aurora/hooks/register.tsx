@@ -406,22 +406,23 @@ const writeLedger = ($: Dollar, now: number, limits: readonly SessionRateLimit[]
     await $.store.set('ledger2', l)
   })
 
-// The running task's input + output tokens: exact for finished responses, estimated for the ones still streaming.
-const liveIo = (task: Cur) => {
+// The running task's billed tokens (in+out+cache): exact for finished responses, estimated for the ones still streaming.
+const liveTokens = (task: Cur) => {
   let chars = 0
   for (const n of streaming.values()) chars += n
-  return task.io + Math.round(chars / CHARS_PER_TOKEN)
+  return task.tokens + Math.round(chars / CHARS_PER_TOKEN)
 }
+export const taskTok = (label: string, tokens: number, usd: number) => `${label} ${fmt(tokens)} tok${usd > 0 ? ` · $${usd.toFixed(2)}` : ''}`
 
 const statusLine = async ($: Dollar, snap: Snapshot, now: number) => {
   const v = splitWindow(snap, sid, now)
   const parts = [`🧮 5h ${pct(v.total)}`]
   if (v.mine !== undefined) parts.push(`this device ${pct(v.mine)}`)
   const task = cur
-  if (task) parts.push(`task ${fmt(liveIo(task))} tok`)
+  if (task) parts.push(taskTok('task', liveTokens(task), task.usd))
   else {
     const last = (await read($, reports)).at(-1)
-    if (last?.io !== undefined) parts.push(`last task ${fmt(last.io)} tok`)
+    if (last) parts.push(taskTok('last task', last.tokens, last.usd))
   }
   $.ui.status(parts.join(' · '))
 }
@@ -433,11 +434,31 @@ const drawSoon = ($: Dollar, now: number) => {
   void statusLine($, lastSnap, now).catch(() => undefined)
 }
 
+// Shared by every session on the device (store key `pollBackoff`): 429/5xx waits Retry-After, else 2→4→8→16 min, capped at 30.
+export type Backoff = { until: number; step: number; status: number }
+export const nextBackoff = (prev: Backoff | undefined, status: number, headers: Record<string, string>, now: number): Backoff | undefined => {
+  if (status !== 429 && status < 500) return undefined
+  const step = (prev?.step ?? 0) + 1
+  const ra = headers['retry-after']?.trim()
+  const after = ra && /^\d+$/.test(ra) ? Number(ra) * 1000 : ra ? Date.parse(ra) - now : Number.NaN
+  const wait = Number.isFinite(after) && after >= 0 ? after : Math.min(2 ** step, 30) * 60_000
+  return { until: now + wait, step, status }
+}
+export const backoffNote = (b: Backoff) => {
+  const d = new Date(b.until)
+  return `HTTP ${b.status}, retrying at ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
 // Reads the account's window figures straight from the usage endpoint, so the strip is right even when nothing has run since a reset.
 const poll = async ($: Dollar, force = false) => {
   const now = await $.clock.now()
   const l = await loadLedger($)
   if (!force && l.at !== undefined && now - l.at < FRESH_MS) return
+  const held = (await $.store.get('pollBackoff')) as Backoff | undefined
+  if (held && now < held.until) {
+    pollNote = backoffNote(held)
+    return
+  }
   const a = await $.session.authorize().catch(() => null)
   if (!a || a.kind !== 'bearer') {
     pollNote = 'no subscription sign-in; the window updates only from responses'
@@ -449,9 +470,12 @@ const poll = async ($: Dollar, force = false) => {
   })
   if (!res) return
   if (!res.ok) {
-    pollNote = `HTTP ${res.status}`
+    const b = nextBackoff(held, res.status, res.headers ?? {}, now)
+    if (b) await $.store.set('pollBackoff', b)
+    pollNote = b ? backoffNote(b) : `HTTP ${res.status}`
     return
   }
+  if (held) await $.store.delete('pollBackoff')
   let limits: SessionRateLimit[] = []
   try {
     limits = parseUsage(res.text)
@@ -717,7 +741,7 @@ const taskCard = async ($: Dollar, ui: ElementTable, rid: string) => {
         <Text>
           <Text bold>🧮 Task {r.n}{r.isAborted ? ' (interrupted)' : ''} · </Text>
           <Text bold color={C.mine}>{shareText} of 5h</Text>
-          <Text dimColor> · {fmt(r.io ?? r.tokens)} tokens in+out · {dur(r.durationMs)}</Text>
+          <Text dimColor> · {fmt(r.tokens)} tok · ${r.usd.toFixed(2)} (in+out {fmt(r.io ?? r.tokens)}) · {dur(r.durationMs)}</Text>
         </Text>
         <Button key={`hide-${rid}`} label="×" onPress={() => update($, dismissed, l => [...l.filter(x => x !== rid), rid].slice(-40))} />
       </Box>
@@ -777,7 +801,7 @@ export const register: Register = on => {
     await poll($, true).catch(() => undefined)
     const t = await read($, totals)
     const rateNote = snap.isFixed ? `rate ${snap.rate} %/USD fixed (learned ${snap.learned ?? 'none'} from ${snap.samples} samples)` : `rate ${snap.rate ?? 'uncalibrated'} %/USD learned from ${snap.samples} samples${snap.isSuspect ? ', likely inflated by other devices' : ''}`
-    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)} (seen while idle ${pct(snap.foreign ?? 0)}); ${rateNote}; live poll: ${pollNote || 'not yet'}; session tokens in+out ${fmt(t.io)}, cache ${fmt(t.cache)}`
+    const split = `5h ${pct(v.total)}: this device ${pct(v.mine)}, other devices ${pct(v.other)} (seen while idle ${pct(snap.foreign ?? 0)}); ${rateNote}; live poll: ${pollNote || 'not yet'}; session tokens billed ${fmt(t.io + t.cache)} (in+out ${fmt(t.io)}, cache ${fmt(t.cache)})`
     const rows = v.rows.map(r => `${r.isLive ? 'running' : 'task'} ${r.isHere ? '(this session)' : '(other session)'} "${short(r.title, 50)}": ${pct(r.share)}`)
     const summary = last ? `last task #${last.n}: rec ${last.recState}${last.rec ? ` -> ${last.rec.model}: ${last.rec.task}` : ''}` : 'no task report in this session yet'
     return { result: [split, ...rows, summary, ...lines.slice(-20)].join('\n') }
@@ -1051,17 +1075,13 @@ export const register: Register = on => {
           <Text bold>Tokens</Text>
           <Text>
             <Text dimColor>This session  </Text>
-            <Text bold>{fmt(t.io)}</Text>
-            <Text dimColor> in+out · </Text>
-            <Text bold>{fmt(t.cache)}</Text>
-            <Text dimColor> cache read+write</Text>
+            <Text bold>{fmt(t.io + t.cache)}</Text>
+            <Text dimColor> tok billed{lastCost !== undefined ? ` · $${lastCost.toFixed(2)}` : ''} (in+out {fmt(t.io)} · cache read+write {fmt(t.cache)})</Text>
           </Text>
           <Text>
             <Text dimColor>This device, 5h  </Text>
-            <Text bold>{fmt(w.io)}</Text>
-            <Text dimColor> in+out · </Text>
-            <Text bold>{fmt(w.cache)}</Text>
-            <Text dimColor> cache</Text>
+            <Text bold>{fmt(w.io + w.cache)}</Text>
+            <Text dimColor> tok billed (in+out {fmt(w.io)} · cache {fmt(w.cache)})</Text>
           </Text>
         </Box>
 

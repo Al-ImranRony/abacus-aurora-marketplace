@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 
-import { calibrate, FOREIGN_LAG_MS, isFollowUp, isRateSuspect, parseRate, parseUsage, rateOf, splitWindow, trackForeign, windowTokens } from '../hooks/register'
+import { backoffNote, calibrate, FOREIGN_LAG_MS, isFollowUp, nextBackoff, isRateSuspect, parseRate, parseUsage, rateOf, splitWindow, taskTok, trackForeign, windowTokens } from '../hooks/register'
 
 const RESET = '2030-01-01T05:00:00.000Z'
 const usage = (model: string, input: number, output: number) => ({
@@ -291,4 +291,64 @@ test('three devices at once: spans where others ran are skipped, so the learned 
   const rate = rateOf(samples) ?? NaN
   expect(rate > 1.9 && rate < 2.1).toBe(true)
   expect(isRateSuspect(samples)).toBe(true)
+})
+
+test('the strip shows the billed total (in+out+cache) and cost, not in+out alone', () => {
+  // 715 in+out with an expired cache: billed 585.5K tok, $4.33.
+  expect(taskTok('last task', 715 + 584_785, 4.331)).toBe('last task 585.5K tok · $4.33')
+  expect(taskTok('task', 900, 0)).toBe('task 900 tok')
+})
+
+test('usage poll backs off on 429/5xx: Retry-After first, else 2→4→8→16 min, capped at 30, none on other codes', () => {
+  const now = 1_000_000
+  const min = 60_000
+  const a = nextBackoff(undefined, 429, {}, now)
+  expect(a).toEqual({ until: now + 2 * min, step: 1, status: 429 })
+  const b = nextBackoff(a, 503, {}, now)
+  expect(b?.until).toBe(now + 4 * min)
+  const c = nextBackoff(b, 429, {}, now)
+  expect(c?.until).toBe(now + 8 * min)
+  const d = nextBackoff(c, 429, {}, now)
+  expect(d?.until).toBe(now + 16 * min)
+  expect(nextBackoff(d, 429, {}, now)?.until).toBe(now + 30 * min)
+  expect(nextBackoff({ until: 0, step: 9, status: 429 }, 429, {}, now)?.until).toBe(now + 30 * min)
+  expect(nextBackoff(undefined, 429, { 'retry-after': '120' }, now)?.until).toBe(now + 120_000)
+  expect(nextBackoff(undefined, 429, { 'retry-after': new Date(now + 5 * min).toUTCString() }, now)?.until).toBe(now + 5 * min)
+  expect(nextBackoff(undefined, 404, {}, now)).toBe(undefined)
+  expect(backoffNote({ until: new Date(2030, 0, 1, 9, 5).getTime(), step: 1, status: 429 })).toBe('HTTP 429, retrying at 09:05')
+})
+
+test('a backed-off poll, even a forced one, sends no request until the shared backoff ends', async ($: any, on: any) => {
+  const clock = mock.clock(on, { now: 1_000_000 })
+  const kept = new Map<string, unknown>()
+  on('store.get', (_: unknown, e: any) => ({ value: kept.get(e.key) }))
+  on('store.set', (_: unknown, e: any) => (kept.set(e.key, e.value), { value: undefined }))
+  on('store.delete', (_: unknown, e: any) => (kept.delete(e.key), { value: undefined }))
+  on('store.keys', () => ({ value: [...kept.keys()] }))
+  let fetches = 0
+  let status = 429
+  on('session.authorize', () => ({ value: { kind: 'bearer', handle: 'h' } }))
+  on('http.fetch', () => (fetches++, { value: { status, ok: status < 300, headers: {}, text: JSON.stringify({ five_hour: { utilization: 12, resets_at: RESET } }) } }))
+  on('command.register', () => ({ value: { command: 'aurora' } }))
+  on('tool.register', () => ({ value: {} }))
+  on('tool.call', () => ({ result: {} }))
+  on('command.run', () => ({ text: '' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('ui.status', () => ({ value: undefined }))
+  on('session.start', (_: unknown, e: any) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 's1' }))
+  on('session.usage', () => ({ value: { startedAt: 0, rateLimits: [], cost: { usd: 0 } } }))
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await clock.settle()
+  expect(fetches).toBe(1)
+  const b = kept.get('pollBackoff') as { until: number }
+  expect(b.until).toBe(1_000_000 + 2 * 60_000)
+  // The status tool forces a poll; it still waits, and so does the 60s tick.
+  await $.tool.call({ tool: 'mcp__abacus-aurora__status', input: {} } as never)
+  await clock.advance(60_000)
+  expect(fetches).toBe(1)
+  status = 200
+  await clock.advance(60_000)
+  expect(fetches).toBe(2)
+  expect(kept.has('pollBackoff')).toBe(false)
 })
